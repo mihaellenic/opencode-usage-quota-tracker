@@ -1,6 +1,6 @@
 {
   "name": "opencode-usage-quota-tracker",
-  "version": "1.0.0-alpha.6",
+  "version": "1.0.0-alpha.7",
   "description": "Live provider quota and usage tracker (tokens, cost, 5h/1w/1mo windows) for OpenCode plans, in the sidebar footer.",
   "keywords": [
     "cost",
@@ -36,7 +36,7 @@
     "test:coverage": "vp exec vitest run --coverage"
   },
   "dependencies": {
-    "@opencode/plugin": "^2.0.3",
+    "@opencode/plugin": "2.0.26",
     "opencode-plugin-kit": "^1.0.0-alpha.6",
     "solid-js": "^1.9.12"
   },
