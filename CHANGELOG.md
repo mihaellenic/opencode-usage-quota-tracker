@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Behaviour-level coverage for `providerUsage` accumulated totals across multiple sessions and tolerant message lists.
+
 ## [1.0.0-alpha.6] - 2026-09-27
 
 ### Changed
