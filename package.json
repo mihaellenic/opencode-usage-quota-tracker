@@ -27,6 +27,7 @@
     "./tui": "./tui.tsx"
   },
   "scripts": {
+    "prepare": "vp config --no-agent",
     "test": "vp test",
     "check": "vp check",
     "check:fix": "vp check --fix",
