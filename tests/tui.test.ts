@@ -366,6 +366,30 @@ describe("providerUsage", () => {
     expect(refreshed).not.toBe(first)
     expect(refreshed.totals.h5).toBe(50)
   })
+
+  it("accumulates token buckets across two sessions (multi-session aggregation)", () => {
+    // Each session list returns a distinct id; providerTotals' walker runs
+    // over every cached session independently, so totals must add across them
+    // rather than reset/clobber as successive sessions are processed.
+    const ctx = fakeCtx(
+      () => [{ id: "a" }, { id: "b" }],
+      (sid) =>
+        sid === "a"
+          ? [msg({ tokens: { input: 30 }, time: { created: IN_5H } })]
+          : [msg({ tokens: { input: 70 }, time: { created: IN_5H } })],
+    )
+    const u = providerUsage(ctx as any, ZEN_PROVIDER)
+    expect(u.totals.h5).toBe(100)
+    expect(u.byModel["claude-free"].h5).toBe(100)
+  })
+
+  it("a stale session (second id missing) does not disturb the first session's bucket", () => {
+    const ctx = fakeCtx(
+      () => [{ id: "a" }, { id: "b" }, null as any],
+      (sid) => (sid === "a" ? [msg({ tokens: { input: 12 }, time: { created: IN_5H } })] : []),
+    )
+    expect(providerUsage(ctx as any, ZEN_PROVIDER).totals.h5).toBe(12)
+  })
 })
 
 describe("fetchUsage", () => {
