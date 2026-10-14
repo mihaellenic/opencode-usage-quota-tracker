@@ -23,9 +23,6 @@ import {
   unwrap,
   ZEN_PROVIDER,
 } from "opencode-plugin-kit"
-import { homedir } from "node:os"
-import { join } from "node:path"
-import { createRequire } from "node:module"
 
 // This plugin shows provider quota and usage for the OpenCode workspace
 // (go/zen plan quota; usage + model breakdown for every authenticated
@@ -33,6 +30,11 @@ import { createRequire } from "node:module"
 const USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 const POLL_MS = 60_000
 const STALE_AFTER_MS = 2 * POLL_MS
+// A hung request would otherwise pin the polling fetcher's in-flight flag
+// forever, silently freezing the footer on a stale value.
+const FETCH_TIMEOUT_MS = 10_000
+// TTL for the disk-backed key list and for the message scan.
+const SCAN_TTL_MS = 30_000
 
 interface Window {
   status?: string
@@ -57,61 +59,20 @@ interface GoTotals {
 // The usage endpoint accepts any workspace key. Try the Zen (opencode)
 // provider key first, then fall back to the Go provider key, so the widget
 // also works for users who only have a Zen key.
+//
+// The kit's authKeys() already reads BOTH credential stores OpenCode has ever
+// used — the v2 SQLite `credential` table (trying bun:sqlite, then node:sqlite)
+// and the legacy auth.json, with SQLite winning on conflict — and returns the
+// keys in the order given here. So this is the single credential read; do not
+// re-open the database here.
 export function apiKeys(): string[] {
   const now = Date.now()
-  if (_keysCache && now - _keysCache.at < 30_000) return _keysCache.keys
-  const ordered = [ZEN_PROVIDER, GO_PROVIDER]
-  // OpenCode 2 stores credentials in the SQLite credential table; auth.json
-  // is the legacy V1 store. Read both, preferring the SQLite keys.
-  const db = readDbKeys()
-  const keys = [...ordered.map((id) => db[id]).filter(Boolean), ...authKeys(ordered)]
-  const unique = [...new Set(keys)]
-  _keysCache = { at: now, keys: unique }
-  return unique
+  if (_keysCache && now - _keysCache.at < SCAN_TTL_MS) return _keysCache.keys
+  const keys = authKeys([ZEN_PROVIDER, GO_PROVIDER])
+  _keysCache = { at: now, keys }
+  return keys
 }
 let _keysCache: { at: number; keys: string[] } | null = null
-
-/** Resolve Bun's SQLite driver across ESM/CJS module systems. */
-function loadBunDatabase(): any {
-  const attempts: Array<() => any> = [
-    () => (import.meta as any).require?.("bun:sqlite"),
-    () => (globalThis as any).require?.("bun:sqlite"),
-    () => createRequire(import.meta.url)("bun:sqlite"),
-    () => (Function("return require")() as any)("bun:sqlite"),
-  ]
-  /* v8 ignore start -- driver resolution is Bun-only; unreachable under the Node CI runner */
-  for (const attempt of attempts) {
-    try {
-      const mod = attempt()
-      if (mod?.Database) return mod.Database
-    } catch {}
-  }
-  /* v8 ignore stop */
-  return null
-}
-
-/** API keys from the OpenCode 2 SQLite credential store, keyed by provider. */
-function readDbKeys(): Record<string, string> {
-  /* v8 ignore start -- the bun:sqlite driver path is unreachable under the Node CI runner */
-  try {
-    const Database = loadBunDatabase()
-    if (!Database) return {}
-    const db = new Database(join(homedir(), ".local/share/opencode/opencode.db"), { readonly: true } as any)
-    const out: Record<string, string> = {}
-    for (const row of db.query("SELECT integration_id, value FROM credential").all() as any[]) {
-      const id = String(row.integration_id ?? "").trim()
-      const key = JSON.parse(String(row.value ?? ""))?.key
-      if (id && typeof key === "string" && key.trim()) out[id] = key.trim()
-    }
-    try {
-      ;(db as any).close?.()
-    } catch {}
-    return out
-  } catch {
-    return {}
-  }
-  /* v8 ignore stop */
-}
 
 // Sum tokens/cost across the session's assistant messages that used the
 // given provider. Delegates to the kit's defensive message walker.
@@ -142,13 +103,207 @@ interface FreeModelUsage {
   cooldowns: Record<string, number> // model id -> epoch ms when the window frees up
 }
 
-let providerUsageCache: { at: number; value: Record<string, FreeModelUsage> } | null = null
+// ---------------------------------------------------------------------------
+// Incremental message scan
+// ---------------------------------------------------------------------------
+//
+// Summing usage means reading every session's message history, so the naive
+// shape — re-walk everything every 30s — is O(sessions x messages) forever, and
+// it used to repeat once per rendered provider view. Instead each message is
+// parsed at most once into a compact ScanEntry, and the 5h / week / month
+// windows are derived from the stored timestamps at query time. Two wins:
+//
+//   * unchanged sessions are skipped entirely (fingerprint match), so a long
+//     history costs nothing on the common path, and
+//   * rolling windows stay correct without re-parsing, because window
+//     membership is recomputed from `ts` on every call rather than baked in.
+//
+// The scan is shared by every provider view, so N views cost one walk, not N.
 
-// Test-only: clear the module-level provider-usage and API-key caches between
-// tests (both are time-cached and the tests freeze the clock).
+/** One parsed assistant message. Small by design: it holds aggregates, not the
+ *  message itself, so memory tracks the month window rather than all history. */
+interface ScanEntry {
+  providerID: string
+  model: string
+  /** Epoch ms, always >= the current month's start — older messages cannot
+   *  land in any window, so they are never stored. */
+  ts: number
+  tokens: number
+  /** Model id -> cooldown epoch harvested from this message's error parts. */
+  cooldowns?: Record<string, number>
+}
+
+interface SessionScan {
+  /** Cheap change detector for the session's message list. Message lists are
+   *  append-only, so the length plus the identity of the last entry suffices. */
+  fingerprint: string
+  entries: ScanEntry[]
+}
+
+// Per context, so two plugin instances never share a scan. Reassigned (not
+// cleared) by __resetProviderUsageCache — a WeakMap has no clear().
+let _scans = new WeakMap<object, Map<string, SessionScan>>()
+let _scannedAt = new WeakMap<object, number>()
+
+// Test-only: clear the message-scan and API-key caches between tests (both are
+// time-cached and the tests freeze the clock).
 export function __resetProviderUsageCache(): void {
-  providerUsageCache = null
+  _scans = new WeakMap()
+  _scannedAt = new WeakMap()
   _keysCache = null
+}
+
+/** Epoch ms boundaries of the three tracked windows. The week starts Monday
+ *  00:00 UTC, matching the server's weekly window. */
+function windowStarts(now: number): { h5: number; week: number; month: number } {
+  const weekStart = new Date(
+    Date.UTC(new Date(now).getUTCFullYear(), new Date(now).getUTCMonth(), new Date(now).getUTCDate()),
+  )
+  weekStart.setUTCDate(weekStart.getUTCDate() - ((weekStart.getUTCDay() + 6) % 7)) // Monday
+  return {
+    h5: now - 5 * 3600_000,
+    week: weekStart.getTime(),
+    month: Date.UTC(new Date(now).getUTCFullYear(), new Date(now).getUTCMonth(), 1),
+  }
+}
+
+/** Identity of a session's last message, used to skip re-parsing an unchanged
+ *  session. Falls back to created + tokens when the shape carries no id. */
+function fingerprintOf(list: readonly unknown[]): string {
+  const last = list.length ? unwrap(list[list.length - 1] as any) : undefined
+  if (!last) return "0"
+  const created = last?.time?.created ?? last?.timeCreated ?? last?.createdAt ?? ""
+  return `${list.length}:${last?.id ?? ""}:${created}:${last?.tokens ? JSON.stringify(last.tokens) : ""}`
+}
+
+/** Re-parse one session's messages into compact entries. Skipped entirely when
+ *  the fingerprint is unchanged since the last scan. */
+function scanSession(context: any, sid: string, into: Map<string, SessionScan>, monthStart: number): void {
+  const list = context.data.session.message.list(sid) as readonly any[] | undefined
+  if (!list) {
+    into.delete(sid)
+    return
+  }
+  const fingerprint = fingerprintOf(list)
+  const prev = into.get(sid)
+  if (prev && prev.fingerprint === fingerprint) return
+
+  const entries: ScanEntry[] = []
+  for (const raw of list) {
+    const m = unwrap(raw)
+    // Only assistant messages carry usage, and only they carry limit errors.
+    if (!isAssistant(m)) continue
+    const created = m?.time?.created ?? m?.timeCreated ?? m?.createdAt
+    const ts = typeof created === "number" ? created : Date.parse(created ?? "")
+    if (!Number.isFinite(ts)) continue
+    // Beyond the month window nothing is tracked, so drop it at the door
+    // rather than carrying dead history in memory.
+    if (ts < monthStart) continue
+
+    // Limit errors ride along as error parts. Match on `part.error` only:
+    // scanning free text let ordinary prose ("if you hit a limit, retry in 3
+    // hours") fake a cooldown badge onto a model.
+    let cooldowns: Record<string, number> | undefined
+    for (const part of (m?.parts ?? []) as any[]) {
+      const err = part?.error
+      if (!err) continue
+      const untilMs = parseCooldown(String(err?.message ?? err))
+      if (!untilMs) continue
+      // A part may name the model it applies to, on the error or the part
+      // itself (a bare string error has no fields); else the message's model.
+      const pmodel = String(err?.modelID ?? part?.modelID ?? modelId(m))
+      cooldowns ??= {}
+      cooldowns[pmodel] = Math.max(cooldowns[pmodel] ?? 0, untilMs)
+    }
+
+    const tokens = m?.tokens ?? {}
+    const read = tokens?.cache?.read
+    const readTokens = Number(typeof read === "object" ? (read?.input ?? 0) : (read ?? 0)) || 0
+    const total =
+      (Number(tokens?.input ?? 0) || 0) +
+      (Number(tokens?.output ?? 0) || 0) +
+      (Number(tokens?.reasoning ?? 0) || 0) +
+      readTokens
+    // A limit error is worth keeping even when the message burned no tokens.
+    if (total <= 0 && !cooldowns) continue
+    entries.push({ providerID: providerId(m), model: modelId(m), ts, tokens: total, cooldowns })
+  }
+  into.set(sid, { fingerprint, entries })
+}
+
+/** Refresh (at most) this context's scan and return it. A single session that
+ *  fails to read keeps its previous scan; the rest still update. */
+function scanSessions(context: any): Map<string, SessionScan> {
+  const now = Date.now()
+  const scans = _scans.get(context) ?? new Map<string, SessionScan>()
+  if (now - (_scannedAt.get(context) ?? 0) < SCAN_TTL_MS) return scans
+
+  let listed: readonly any[] = []
+  try {
+    listed = context.data.session.list() ?? []
+  } catch {
+    // Keep the previous scan rather than blanking the footer.
+    _scans.set(context, scans)
+    _scannedAt.set(context, now)
+    return scans
+  }
+
+  const { month } = windowStarts(now)
+  const seen = new Set<string>()
+  for (const s of listed) {
+    const sid = String(s?.id ?? s?.info?.id ?? "")
+    if (!sid) continue
+    seen.add(sid)
+    try {
+      scanSession(context, sid, scans, month)
+    } catch {
+      // This session's history is unreadable — keep whatever we had for it.
+    }
+  }
+  // Drop sessions that no longer exist so deleted history stops counting.
+  for (const sid of scans.keys()) if (!seen.has(sid)) scans.delete(sid)
+
+  _scans.set(context, scans)
+  _scannedAt.set(context, now)
+  return scans
+}
+
+// Sum tokens per model over the rolling 5h window, the current UTC week, and
+// the current calendar month, scoped to one provider's assistant messages. The
+// zen view tracks free-tier models; other providers track all of their models.
+// Reads the shared incremental scan (above) and derives window membership per
+// call, so this is cheap enough to run on every render. Local estimate only —
+// the server keeps no per-provider quota API outside the go/zen endpoint.
+export function providerUsage(context: any, providerID: string): FreeModelUsage {
+  const totals: FreeWindows = { h5: 0, week: 0, month: 0 }
+  const byModel: Record<string, FreeWindows> = {}
+  const cooldowns: Record<string, number> = {}
+  const { h5, week, month } = windowStarts(Date.now())
+  for (const session of scanSessions(context).values()) {
+    for (const e of session.entries) {
+      if (e.providerID !== providerID) continue
+      if (providerID === ZEN_PROVIDER && !isFreeModel(e.model)) continue
+      if (e.cooldowns) {
+        for (const [mid, untilMs] of Object.entries(e.cooldowns))
+          cooldowns[mid] = Math.max(cooldowns[mid] ?? 0, untilMs)
+      }
+      if (e.tokens <= 0) continue
+      const w = (byModel[e.model] ??= { h5: 0, week: 0, month: 0 })
+      if (e.ts >= h5) {
+        w.h5 += e.tokens
+        totals.h5 += e.tokens
+      }
+      if (e.ts >= week) {
+        w.week += e.tokens
+        totals.week += e.tokens
+      }
+      if (e.ts >= month) {
+        w.month += e.tokens
+        totals.month += e.tokens
+      }
+    }
+  }
+  return { totals, byModel, cooldowns }
 }
 
 // Extract a retry/cooldown epoch from a limit-error payload. The Zen API is
@@ -173,88 +328,11 @@ export function parseCooldown(text: string): number | null {
   return null
 }
 
-// Sum tokens per model over the rolling 5h window, the current UTC week
-// (Mon 00:00, matching the server's weekly window), and the current calendar
-// month, scoped to one provider's assistant messages. The zen view tracks
-// free-tier models; other providers track all of their models. Walks every
-// cached session; throttled because it is O(sessions × messages). Local
-// estimate only — the server keeps no per-provider quota API outside the
-// go/zen plan endpoint.
-export function providerUsage(context: any, providerID: string): FreeModelUsage {
-  const cached = providerUsageCache?.value[providerID]
-  if (providerUsageCache && Date.now() - providerUsageCache.at < 30_000 && cached) return cached
-  const totals: FreeWindows = { h5: 0, week: 0, month: 0 }
-  const byModel: Record<string, FreeWindows> = {}
-  const cooldowns: Record<string, number> = {}
-  const now = Date.now()
-  const h5Start = now - 5 * 3600_000
-  const weekStart = new Date(
-    Date.UTC(new Date(now).getUTCFullYear(), new Date(now).getUTCMonth(), new Date(now).getUTCDate()),
-  )
-  weekStart.setUTCDate(weekStart.getUTCDate() - ((weekStart.getUTCDay() + 6) % 7)) // Monday
-  const monthStart = Date.UTC(new Date(now).getUTCFullYear(), new Date(now).getUTCMonth(), 1)
-  const bump = (model: string, ts: number, total: number) => {
-    const w = (byModel[model] ??= { h5: 0, week: 0, month: 0 })
-    if (ts >= h5Start) {
-      w.h5 += total
-      totals.h5 += total
-    }
-    if (ts >= weekStart.getTime()) {
-      w.week += total
-      totals.week += total
-    }
-    if (ts >= monthStart) {
-      w.month += total
-      totals.month += total
-    }
-  }
-  try {
-    for (const s of context.data.session.list() ?? []) {
-      const sid = (s as any)?.id ?? (s as any)?.info?.id
-      if (!sid) continue
-      for (const entry of context.data.session.message.list(sid) ?? []) {
-        const m = unwrap(entry)
-        const model = modelId(m)
-        // Limit errors ride along as message parts; harvest their cooldown.
-        for (const part of (m?.parts ?? []) as any[]) {
-          const ptext = String(part?.error?.message ?? part?.error ?? part?.text ?? "")
-          if (!/limit|usagelimiterror/i.test(ptext)) continue
-          const untilMs = parseCooldown(ptext)
-          const pmodel = String(part?.error?.modelID ?? part?.modelID ?? model)
-          if (untilMs) cooldowns[pmodel] = Math.max(cooldowns[pmodel] ?? 0, untilMs)
-        }
-        if (!isAssistant(m) || providerId(m) !== providerID) continue
-        if (providerID === ZEN_PROVIDER && !isFreeModel(model)) continue
-        const tokens = m?.tokens ?? {}
-        const read = tokens?.cache?.read
-        const readTokens = Number(typeof read === "object" ? (read?.input ?? 0) : (read ?? 0)) || 0
-        const total =
-          (Number(tokens?.input ?? 0) || 0) +
-          (Number(tokens?.output ?? 0) || 0) +
-          (Number(tokens?.reasoning ?? 0) || 0) +
-          readTokens
-        if (total <= 0) continue
-        const created = m?.time?.created ?? m?.timeCreated ?? m?.createdAt
-        const ts = typeof created === "number" ? created : Date.parse(created ?? "")
-        if (!Number.isFinite(ts)) continue
-        bump(model, ts, total)
-      }
-    }
-  } catch {
-    // Keep whatever was accumulated.
-  }
-  providerUsageCache = {
-    at: Date.now(),
-    value: { ...providerUsageCache?.value, [providerID]: { totals, byModel, cooldowns } },
-  }
-  return { totals, byModel, cooldowns }
+// Plan quota from the same endpoint the console uses. The durable cache needs
+// the plugin context, so the store is created inside setup().
+export function createUsageStore(context: any) {
+  return createCachedStore<GoUsage | null>(context, "usage", { initial: null, staleAfterMs: STALE_AFTER_MS })
 }
-
-// Plan quota from the same endpoint the console uses. The fetch/caching
-// closures live in setup() because the durable cache needs the plugin
-// context (see usageCache below).
-type UsageCache = ReturnType<typeof createUsageStore>
-let usageCache: UsageCache
 
 // Fetch usage, trying each workspace key in order. Returns the parsed
 // usage on success, null to keep the last-known-good cache on failure.
@@ -263,7 +341,12 @@ export async function fetchUsage(): Promise<GoUsage | null> {
   if (keys.length === 0) return null
   for (const key of keys) {
     try {
-      const res = await fetch(USAGE_URL, { headers: { Authorization: `Bearer ${key}` } })
+      // Without a timeout a hung request pins the polling fetcher's in-flight
+      // flag forever, and the footer silently freezes on a stale value.
+      const res = await fetch(USAGE_URL, {
+        headers: { Authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      })
       if (res.ok) {
         // Parse, don't cast: an unrecognized shape degrades to the last
         // known-good cache instead of poisoning it.
@@ -275,13 +358,6 @@ export async function fetchUsage(): Promise<GoUsage | null> {
     }
   }
   return null
-}
-
-// Durable cache: the slot render is synchronous, so the latest successful
-// fetch is what gets displayed and a background timer keeps it fresh —
-// including instantly after a TUI restart, from storage.
-export function createUsageStore(context: any) {
-  return createCachedStore<GoUsage | null>(context, "usage", { initial: null, staleAfterMs: STALE_AFTER_MS })
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +420,10 @@ export function renderRow(context: any, row: Row, sessionID?: string): string {
 export default Plugin.define({
   id: "opencode-go.usage.tui",
   setup(context: any) {
-    usageCache = createUsageStore(context)
+    // Scoped to this instance on purpose: a module-level store would be
+    // clobbered by the next setup(), so a reloaded plugin's fetcher would
+    // write into the new instance's cache instead of its own.
+    const usageCache = createUsageStore(context)
 
     // Polling fetcher: throttles, guards concurrent fetches, and keeps the
     // last-known-good value on failure. Replaces manual setInterval + flags.
@@ -414,21 +493,24 @@ export default Plugin.define({
       return rows
     }
 
-    // One view per authenticated provider (plus go's plan-quota rows and
-    // zen's free-tier breakdown). Built from the same discovery the picker
-    // and tool use, so new providers appear without edits. Go stays first —
-    // it was the original default view, so persisted picks keep matching.
-    const buildViews = (): ProviderView[] => {
+    // One view per provider (plus go's plan-quota rows and zen's free-tier
+    // breakdown). Built from the same discovery the picker and tool use, so a
+    // new provider needs no code change. Go stays first — it was the original
+    // default view, so persisted picks keep matching.
+    const buildViewsFrom = (ids: readonly string[]): ProviderView[] => {
       const priority = new Map<string, number>([
         [GO_PROVIDER, 0],
         [ZEN_PROVIDER, 1],
       ])
-      return availableProviders()
+      return [...ids]
+        .sort((a, b) => (priority.get(a) ?? 99) - (priority.get(b) ?? 99))
         .map((pid): ProviderView => {
           const label = providerLabel(pid)
+          // The view id is the provider id, NOT the display label: labels are
+          // cosmetic and can be reworded, and persisted picks must survive that.
           if (pid === GO_PROVIDER) {
             return {
-              id: label,
+              id: pid,
               title: providerTitle(pid),
               description: "Go plan usage line and quota windows",
               providerID: pid,
@@ -438,7 +520,7 @@ export default Plugin.define({
           // zen = free-tier breakdown; any other provider = its model usage.
           const zenLike = pid === ZEN_PROVIDER
           return {
-            id: label,
+            id: pid,
             title: providerTitle(pid),
             description: `${providerTitle(pid)} usage and model breakdown`,
             providerID: pid,
@@ -465,9 +547,28 @@ export default Plugin.define({
             },
           }
         })
-        .sort((a, b) => (priority.get(a.providerID) ?? 99) - (priority.get(b.providerID) ?? 99))
     }
-    const VIEWS = buildViews()
+
+    // VIEWS is a live registry, not a setup-time snapshot. Its identity is
+    // stable (the picker captures this array exactly once) but its contents
+    // track the connected set, so running /connect mid-session surfaces a new
+    // provider within one poll instead of needing a TUI restart.
+    const VIEWS: ProviderView[] = []
+    let viewsKey = ""
+    const syncViews = () => {
+      // Union of what /connect reports and what the auth store knows. The
+      // connected set alone would drop known-but-disconnected providers, and
+      // the picker needs those in the registry to explain how to add them.
+      const ids = new Set([...availableProviders(), ...connected.ids()])
+      // Never empty: the picker needs a first entry and a registry-less footer
+      // has nothing to paint. Mirrors the kit's own Zen+Go fallback.
+      if (ids.size === 0) ids.add(GO_PROVIDER).add(ZEN_PROVIDER)
+      const key = [...ids].sort().join(",")
+      if (key === viewsKey) return
+      viewsKey = key
+      VIEWS.splice(0, VIEWS.length, ...buildViewsFrom([...ids]))
+    }
+    syncViews()
 
     // Provider the current session is actually using: the provider of the
     // most recent assistant message. Delegates to the kit's resolver.
@@ -484,13 +585,13 @@ export default Plugin.define({
     // Computed, never set during render, so reactivity stays clean.
     const effectiveView = (sessionID?: string): ViewID => {
       const available = availableViews()
-      if (available.length === 0) return "go"
+      if (available.length === 0) return GO_PROVIDER
       const used = sessionProvider(sessionID)
       const usedView = used ? available.find((v) => v.providerID === used) : undefined
       const persisted = VIEWS.find((v) => v.id === picker.currentID())
       return (usedView ?? (available.includes(persisted!) ? persisted : undefined) ?? available[0]).id as ViewID
     }
-    const currentView = (sessionID?: string) => VIEWS.find((v) => v.id === effectiveView(sessionID))!
+    const currentView = (sessionID?: string) => VIEWS.find((v) => v.id === effectiveView(sessionID)) ?? VIEWS[0]
 
     // Picker (registry + persistence + /usage-view command + dialog + toast).
     // A view is selectable only when its provider key is added; a non-empty
@@ -519,13 +620,23 @@ export default Plugin.define({
         // No workspace key configured: render nothing instead of dead weight.
         if (apiKeys().length === 0) return null
 
+        // Pick up providers connected since the last render. This is a plain
+        // array mutation behind a change check — it writes no signal, so it
+        // cannot re-enter the render loop it runs in.
+        syncViews()
+
         // One shared renderer: the active view's registry entry supplies the
-        // rows, the footer just paints them.
-        const lines = currentView(sessionID)
-          .rows(sessionID)
-          .map((row) => renderRow(context, row, sessionID))
-          .filter((l) => l !== "")
-        return <text>{lines.join("\n")}</text>
+        // rows, the footer just paints them. VIEWS is never empty (see
+        // syncViews), so currentView always resolves.
+        const view = currentView(sessionID)
+        return (
+          <text>
+            {view
+              .rows(sessionID)
+              .map((row) => renderRow(context, row, sessionID))
+              .join("\n")}
+          </text>
+        )
       },
     })
 

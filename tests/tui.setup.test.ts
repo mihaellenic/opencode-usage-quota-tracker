@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { bar, until } from "opencode-plugin-kit"
+import { bar, until, ZEN_PROVIDER } from "opencode-plugin-kit"
 
 const mockState = vi.hoisted(() => ({
   keys: [] as string[],
@@ -302,7 +302,8 @@ describe("setup: view auto-pick precedence", () => {
   it("restores the persisted pick when it is available", async () => {
     mockState.providers = ["opencode-go", "opencode"]
     const run = await startPlugin({
-      cells: { view: { id: "zen" } },
+      // Persisted picks are keyed by provider id, not by display label.
+      cells: { view: { id: ZEN_PROVIDER } },
       integrations: [
         { id: "opencode-go", connections: [{}] },
         { id: "opencode", connections: [{}] },
@@ -314,7 +315,8 @@ describe("setup: view auto-pick precedence", () => {
   it("falls back to the first available view when the persisted pick is unavailable", async () => {
     mockState.providers = ["opencode-go", "opencode"]
     const run = await startPlugin({
-      cells: { view: { id: "go" } },
+      // A stale pick: this provider is no longer in the registry at all.
+      cells: { view: { id: "retired-provider" } },
       integrations: [{ id: "opencode", connections: [{}] }],
     })
     expect(footerText(run)).toContain("free 5h 0 tok")
@@ -324,6 +326,45 @@ describe("setup: view auto-pick precedence", () => {
     mockState.providers = ["opencode-go", "opencode"]
     const run = await startPlugin({ integrations: [] })
     expect(footerText(run)).toContain("go usage —")
+  })
+
+  it("falls back to the first registered view when no view is connected", async () => {
+    // Only provider is Google and it is not connected: the registry still has
+    // an entry, so rendering falls back to it rather than going blank.
+    mockState.providers = ["google"]
+    const run = await startPlugin({ integrations: [] })
+    expect(footerText(run)).toContain("google usage")
+  })
+
+  it("keeps a usable registry when no provider is discoverable at all", async () => {
+    mockState.providers = []
+    const run = await startPlugin({ integrations: [] })
+    expect(footerText(run)).toBe("go usage —\nquota —")
+  })
+
+  it("surfaces a provider connected after startup without a restart", async () => {
+    vi.useFakeTimers()
+    mockState.providers = ["opencode-go", "google"]
+    const run = await startPlugin({ integrations: [{ id: "opencode-go", connections: [{}] }] })
+    await vi.advanceTimersByTimeAsync(1)
+    expect(footerText(run)).toContain("go usage")
+
+    // /connect now reports Google as connected too.
+    run.integrationList.mockResolvedValue({
+      data: [
+        { id: "opencode-go", connections: [{}] },
+        { id: "google", connections: [{}] },
+      ],
+    })
+    await vi.advanceTimersByTimeAsync(61_000) // one connected-provider poll
+
+    // The picker offers Google even though it was absent at startup.
+    run.slots[0].render()
+    run.layerCalls[0].commands[0].run()
+    await vi.advanceTimersByTimeAsync(1)
+    const titles = run.ctx.ui.dialog.select.mock.calls.at(-1)[0].options.map((o: any) => o.title)
+    expect(titles).toContain("Google")
+    run.cleanup()
   })
 
   it("renders other providers without the free prefix", async () => {
@@ -358,7 +399,8 @@ describe("setup: picker gating", () => {
   it("alerts with the unavailable message for a view without a key, and applies an available one", async () => {
     mockState.providers = ["opencode-go", "opencode"]
     const run = await startPlugin({
-      cells: { view: { id: "zen" } }, // persisted pick ≠ "go" so apply() actually switches
+      // Persisted pick ≠ Go so apply() actually switches.
+      cells: { view: { id: ZEN_PROVIDER } },
       integrations: [{ id: "opencode-go", connections: [{}] }],
     })
     // registerCommand registered an "app" slot whose render registers the keymap layer.

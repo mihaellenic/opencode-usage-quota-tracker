@@ -165,7 +165,9 @@ describe("providerUsage", () => {
     expect(u.byModel["m1-free"]).toEqual({ h5: 100, week: 100, month: 100 })
     expect(u.byModel["m2-free"]).toEqual({ h5: 0, week: 40, month: 40 })
     expect(u.byModel["m3-free"]).toEqual({ h5: 0, week: 0, month: 20 })
-    expect(u.byModel["m4-free"]).toEqual({ h5: 0, week: 0, month: 0 })
+    // Older than the month window: pruned at scan time, so it is absent
+    // rather than present with zero buckets.
+    expect(u.byModel["m4-free"]).toBeUndefined()
   })
   it("uses Monday as the week start", () => {
     vi.setSystemTime(Date.UTC(2026, 0, 18, 10)) // Sunday
@@ -251,23 +253,22 @@ describe("providerUsage", () => {
     expect(u.totals.h5).toBe(11)
     expect(u.byModel["gemini-pro"].h5).toBe(11)
   })
-  it("harvests cooldowns from parts (error.message, error string, text) with model fallbacks", () => {
+  it("harvests cooldowns from error parts, with message-model fallback", () => {
     const future = T0 + 7200_000
     const ctx = fakeCtx(
       () => [{ id: "a" }],
       () => [
         msg({
-          modelID: "m-default",
+          modelID: "m-default-free",
           tokens: { input: 1 },
           parts: [
             { error: { message: "usage limit reached", modelID: "m-err" } },
             { error: "rate limit exceeded", modelID: "m-str" },
-            { text: "limit hit, retry in 1 hour", modelID: "m-part" },
-            { text: "limit hit, retry in 1 hour" }, // falls back to message model
             { error: { message: `limit reached, reset at ${new Date(future).toISOString()}`, modelID: "m-abs" } },
-            { text: "no cooldown here" }, // no limit keyword → skipped
-            { text: "limit noted" }, // keyword but no parseable cooldown
-            {}, // empty text → skipped
+            { error: { message: "nothing actionable here" } }, // error, but no cooldown
+            { text: "no cooldown here" }, // not an error part → ignored
+            { error: null }, // falsy error → ignored
+            {}, // no error → ignored
           ],
         }),
         // In the week/month windows but not 5h, with no cooldown: exercises
@@ -277,11 +278,42 @@ describe("providerUsage", () => {
     )
     const u = providerUsage(ctx as any, ZEN_PROVIDER)
     expect(u.cooldowns["m-err"]).toBe(T0 + 3600_000)
+    // Bare string error: the model id lives on the part, not the error.
     expect(u.cooldowns["m-str"]).toBe(T0 + 3600_000)
-    expect(u.cooldowns["m-part"]).toBe(T0 + 3600_000)
-    expect(u.cooldowns["m-default"]).toBe(T0 + 3600_000)
     expect(u.cooldowns["m-abs"]).toBe(future)
-    expect(Object.keys(u.cooldowns)).toHaveLength(5)
+    expect(Object.keys(u.cooldowns)).toHaveLength(3)
+  })
+  it("ignores limit wording in ordinary prose (no phantom cooldown)", () => {
+    // Regression: cooldowns must come from error payloads only. Matching free
+    // text let a user (or an assistant explaining a limit) fake a ⏳ badge.
+    const ctx = fakeCtx(
+      () => [{ id: "a" }],
+      () => [
+        {
+          info: {
+            type: "user",
+            providerID: ZEN_PROVIDER,
+            modelID: "claude-free",
+            time: { created: IN_5H },
+            parts: [{ text: "the docs say: if you hit a limit, retry in 3 hours. limit exceeded is the error" }],
+          },
+        },
+        {
+          info: {
+            type: "assistant",
+            providerID: ZEN_PROVIDER,
+            modelID: "claude-free",
+            tokens: { input: 10 },
+            time: { created: IN_5H },
+            // An assistant narrating a limit it hit is still just prose.
+            parts: [{ text: "I was rate limited, please retry in 2 hours" }],
+          },
+        },
+      ],
+    )
+    const u = providerUsage(ctx as any, ZEN_PROVIDER)
+    expect(u.cooldowns).toEqual({})
+    expect(u.totals.h5).toBe(10)
   })
   it("keeps the max cooldown for repeated errors on one model", () => {
     const ctx = fakeCtx(
@@ -306,7 +338,7 @@ describe("providerUsage", () => {
           info: {
             type: "assistant",
             providerID: ZEN_PROVIDER,
-            modelID: "cooldown-model",
+            modelID: "cooldown-model-free",
             tokens: { input: 0 },
             time: { created: IN_5H },
             parts: [{ error: { message: "limit reached, retry in 2 hours" } }],
@@ -314,7 +346,7 @@ describe("providerUsage", () => {
         },
       ],
     )
-    expect(providerUsage(ctx as any, ZEN_PROVIDER).cooldowns["cooldown-model"]).toBe(T0 + 2 * 3600_000)
+    expect(providerUsage(ctx as any, ZEN_PROVIDER).cooldowns["cooldown-model-free"]).toBe(T0 + 2 * 3600_000)
   })
   it("keeps partial accumulators when message.list throws mid-walk", () => {
     const ctx = {
@@ -365,6 +397,79 @@ describe("providerUsage", () => {
     const refreshed = providerUsage(ctx as any, ZEN_PROVIDER)
     expect(refreshed).not.toBe(first)
     expect(refreshed.totals.h5).toBe(50)
+  })
+
+  it("reuses an unchanged session's scan and drops sessions that disappear", () => {
+    // Two messages, so the tail entry can change independently of the head.
+    const head = (n: number) => msg({ tokens: { input: n }, time: { created: IN_5H } })
+    const tail = () => msg({ tokens: { input: 1 }, time: { created: IN_5H } })
+    let messages: Record<string, unknown[]> = { a: [head(5), tail()], b: [] }
+    const ctx = fakeCtx(
+      () => [{ id: "a" }, { id: "b" }],
+      (sid) => messages[sid] ?? [],
+    )
+    expect(providerUsage(ctx as any, ZEN_PROVIDER).totals.h5).toBe(6)
+
+    // Editing a message that is NOT the tail leaves the fingerprint intact, so
+    // the cached scan is reused and the edit is not picked up yet. This is the
+    // documented trade-off: the tail stands in for "did anything change".
+    messages = { a: [head(500), tail()], b: [] }
+    vi.advanceTimersByTime(31_000)
+    expect(providerUsage(ctx as any, ZEN_PROVIDER).totals.h5).toBe(6)
+
+    // Touching the tail does invalidate the scan.
+    messages = { a: [head(500), msg({ tokens: { input: 9 }, time: { created: IN_5H } })], b: [] }
+    vi.advanceTimersByTime(31_000)
+    expect(providerUsage(ctx as any, ZEN_PROVIDER).totals.h5).toBe(509)
+
+    // Session "b" is gone; nothing of it may linger in the scan.
+    messages = { a: [head(500), msg({ tokens: { input: 9 }, time: { created: IN_5H } })] }
+    ;(ctx.data.session as any).list = () => [{ id: "a" }]
+    vi.advanceTimersByTime(31_000)
+    expect(providerUsage(ctx as any, ZEN_PROVIDER).totals.h5).toBe(509)
+  })
+
+  it("re-derives window membership as time crosses a week and month boundary", () => {
+    // 2026-05-31 is a Sunday and the last day of the month, so 20s later both
+    // the week and the month roll over. Entries scanned before the boundary
+    // stay in the 5h window but fall out of the week and month windows.
+    vi.setSystemTime(Date.UTC(2026, 4, 31, 23, 59, 40))
+    const ctx = fakeCtx(
+      () => [{ id: "a" }],
+      () => [msg({ tokens: { input: 7 }, time: { created: Date.UTC(2026, 4, 31, 23, 59, 40) } })],
+    )
+    expect(providerUsage(ctx as any, ZEN_PROVIDER).totals).toEqual({ h5: 7, week: 7, month: 7 })
+
+    vi.advanceTimersByTime(20_000) // now Mon 2026-06-01T00:00:00Z
+    expect(providerUsage(ctx as any, ZEN_PROVIDER).totals).toEqual({ h5: 7, week: 0, month: 0 })
+  })
+
+  it("handles sessions with an empty list and messages with an id", () => {
+    const ctx = fakeCtx(
+      () => [{ id: "a" }, { id: "empty" }],
+      (sid) =>
+        sid === "empty"
+          ? []
+          : [
+              {
+                info: {
+                  type: "assistant",
+                  providerID: ZEN_PROVIDER,
+                  modelID: "claude-free",
+                  id: "m1",
+                  tokens: { input: 4 },
+                  time: { created: IN_5H },
+                },
+              },
+              // No id and no tokens: exercises the fingerprint fallbacks.
+              {
+                info: { type: "assistant", providerID: ZEN_PROVIDER, modelID: "claude-free", time: { created: IN_5H } },
+              },
+            ],
+    )
+    const u = providerUsage(ctx as any, ZEN_PROVIDER)
+    expect(u.totals.h5).toBe(4)
+    expect(u.byModel["claude-free"].h5).toBe(4)
   })
 
   it("accumulates token buckets across two sessions (multi-session aggregation)", () => {
