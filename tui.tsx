@@ -25,9 +25,17 @@ import {
 } from "opencode-plugin-kit"
 
 // This plugin shows provider quota and usage for the OpenCode workspace
-// (go/zen plan quota; usage + model breakdown for every authenticated
-// provider via local message history).
+// (go/zen plan quota; Ollama Cloud balance and limits; usage + model breakdown
+// for every authenticated provider via local message history).
 const USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+// Ollama Cloud reports remaining plan credits and limits here. Unlike
+// /api/usage (request history without limits), this endpoint is authoritative
+// for the footer's quota rows.
+const OLLAMA_BALANCE_URL = "https://ollama.com/api/balance"
+export const OLLAMA_PROVIDER = "ollama-cloud"
+// Ollama's dashboard talks in "% remaining", but the footer's bars fill with
+// consumption like every other view. Warn when almost nothing is left.
+const LOW_LEFT_PERCENT = 10
 const POLL_MS = 60_000
 const STALE_AFTER_MS = 2 * POLL_MS
 // A hung request would otherwise pin the polling fetcher's in-flight flag
@@ -54,6 +62,26 @@ interface GoTotals {
   input: number
   output: number
   cost: number
+}
+
+/** One legacy Ollama Cloud window: how much of the limit is left, and when it
+ *  resets. Percentages are the API's own 0..100 values, before conversion to
+ *  the footer's "% used" convention. */
+interface OllamaLimit {
+  remainingPercent: number
+  resetsAt?: string
+}
+
+/** Parsed `GET https://ollama.com/api/balance`. Plans report either legacy
+ *  session/weekly percentages or included monthly credits in USD. */
+interface OllamaBalance {
+  mode: "limits" | "credits"
+  session?: OllamaLimit
+  weekly?: OllamaLimit
+  balanceUsd?: number
+  allowanceUsd?: number
+  periodUntil?: string
+  purchasedUsd?: number
 }
 
 // The usage endpoint accepts any workspace key. Try the Zen (opencode)
@@ -151,6 +179,8 @@ export function __resetProviderUsageCache(): void {
   _scans = new WeakMap()
   _scannedAt = new WeakMap()
   _keysCache = null
+  _ollamaKeyCache = null
+  _ollamaRetryAt = 0
 }
 
 /** Epoch ms boundaries of the three tracked windows. The week starts Monday
@@ -361,6 +391,99 @@ export async function fetchUsage(): Promise<GoUsage | null> {
 }
 
 // ---------------------------------------------------------------------------
+// Ollama Cloud balance
+// ---------------------------------------------------------------------------
+//
+// Plans come in two shapes: legacy plans report session (5h) and weekly (7d)
+// percentages, while credit plans report an included monthly allowance plus
+// any purchased credits. Both expose reset timestamps, so the footer can
+// count down without guessing window boundaries.
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function isoString(value: unknown): string | undefined {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : undefined
+}
+
+function clampPercent(value: number): number {
+  return Math.max(0, Math.min(100, value))
+}
+
+function parseLimit(raw: any): OllamaLimit | undefined {
+  const remaining = finiteNumber(raw?.remaining_percent)
+  if (remaining === undefined) return undefined
+  return { remainingPercent: clampPercent(remaining), resetsAt: isoString(raw?.resets_at) }
+}
+
+/** Parse the balance payload into the footer's normalized shape. Returns null
+ *  for an unrecognized payload so callers keep the last known-good value. */
+export function parseOllamaBalance(raw: unknown): OllamaBalance | null {
+  const included = (raw as any)?.included
+  if (!included || typeof included !== "object") return null
+
+  const purchasedUsd = finiteNumber((raw as any)?.purchased?.balance_usd)
+
+  // Legacy plans: session/weekly percentages. The API reports both together.
+  const session = parseLimit(included.session)
+  const weekly = parseLimit(included.weekly)
+  if (session && weekly) return { mode: "limits", session, weekly, purchasedUsd }
+
+  // Credit plans: included monthly allowance. The percentage only exists when
+  // both sides of the ratio are present, so require them together.
+  const balanceUsd = finiteNumber(included.balance_usd)
+  const allowanceUsd = finiteNumber(included.allowance_usd)
+  const periodUntil = isoString(included.period?.until)
+  if (balanceUsd === undefined || allowanceUsd === undefined || allowanceUsd <= 0 || !periodUntil) return null
+  return { mode: "credits", balanceUsd, allowanceUsd, periodUntil, purchasedUsd }
+}
+
+// The Ollama key lives in the same OpenCode credential stores as the Go/Zen
+// keys. OLLAMA_API_KEY is the integration's declared env method and is a valid
+// fallback when no key was saved with /connect.
+let _ollamaKeyCache: { at: number; key: string } | null = null
+let _ollamaRetryAt = 0
+
+export function ollamaKey(): string {
+  const now = Date.now()
+  if (_ollamaKeyCache && now - _ollamaKeyCache.at < SCAN_TTL_MS) return _ollamaKeyCache.key
+  const key = (authKeys([OLLAMA_PROVIDER])[0] ?? "").trim() || (process.env.OLLAMA_API_KEY ?? "").trim()
+  _ollamaKeyCache = { at: now, key }
+  return key
+}
+
+/** Fetch the balance, honoring the endpoint's 429 backoff. Returns null to
+ *  keep the last-known-good cache on any failure. */
+export async function fetchOllamaBalance(): Promise<OllamaBalance | null> {
+  const key = ollamaKey()
+  if (!key || Date.now() < _ollamaRetryAt) return null
+  try {
+    const res = await fetch(OLLAMA_BALANCE_URL, {
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    })
+    if (res.status === 429) {
+      const seconds = Number(res.headers?.get?.("retry-after"))
+      _ollamaRetryAt = Date.now() + (Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : POLL_MS)
+      return null
+    }
+    if (!res.ok) return null
+    return parseOllamaBalance(await res.json())
+  } catch {
+    // Network error, timeout, or malformed JSON: keep the cached balance.
+    return null
+  }
+}
+
+function createOllamaBalanceStore(context: any) {
+  return createCachedStore<OllamaBalance | null>(context, "ollama-balance", {
+    initial: null,
+    staleAfterMs: STALE_AFTER_MS,
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Shared row vocabulary — the common UI every view renders through.
 // ---------------------------------------------------------------------------
 
@@ -434,6 +557,17 @@ export default Plugin.define({
       onResult: (usage) => usageCache.set(usage),
     })
 
+    // Ollama Cloud keeps its own cache and poller: the endpoint, auth, and
+    // failure modes are unrelated to the workspace usage endpoint, and a
+    // user can have either key without the other.
+    const balanceCache = createOllamaBalanceStore(context)
+    const ollamaPolling = createPollingFetcher({
+      fetch: fetchOllamaBalance,
+      intervalMs: POLL_MS,
+      throttleMs: POLL_MS,
+      onResult: (balance) => balanceCache.set(balance),
+    })
+
     const compact = context.options?.compact === true
 
     // Footer view selection. VIEWS is the single extension point: each entry
@@ -458,7 +592,10 @@ export default Plugin.define({
     // falls back to availableProviders() (auth.json + HF_TOKEN) when the
     // client is unavailable.
     const connected = createConnectedProviders(context, { pollMs: POLL_MS })
-    const hasKey = (providerID: string): boolean => connected.has(providerID)
+    // Ollama availability follows its own key (stored or env): the balance
+    // endpoint works even before the integration poll reports /connect.
+    const hasKey = (providerID: string): boolean =>
+      providerID === OLLAMA_PROVIDER ? ollamaKey() !== "" : connected.has(providerID)
     const availableViews = () => VIEWS.filter((v) => hasKey(v.providerID))
 
     // Plan quota rows (shared workspace quota; aggregates all providers).
@@ -493,6 +630,47 @@ export default Plugin.define({
       return rows
     }
 
+    // Ollama Cloud balance rows. Credit plans get a monthly bar plus the
+    // remaining/purchased dollars; legacy plans get session/weekly bars. Bars
+    // fill with consumption, and ⚠ flags a window with ≤10% left.
+    const ollamaQuotaRows = (): Row[] => {
+      const balance = balanceCache.value
+      if (!balance) return [{ kind: "text", text: "ollama quota —" }]
+
+      const windowRow = (label: string, remaining: number, resetsAt?: string): Row => ({
+        kind: "window",
+        // Padded so the bars of 5h / 1w / 1mo line up vertically.
+        label: label.padEnd(3),
+        value: "",
+        percent: Math.round(clampPercent(100 - remaining)),
+        resetsAt,
+        warn: remaining <= LOW_LEFT_PERCENT,
+      })
+
+      const rows: Row[] = []
+      if (balance.mode === "limits") {
+        const windows = [
+          ["5h", balance.session!],
+          ["1w", balance.weekly!],
+        ] as const
+        // Compact mode keeps the window closest to running out.
+        const shown = compact
+          ? [windows.reduce((best, entry) => (entry[1].remainingPercent < best[1].remainingPercent ? entry : best))]
+          : windows
+        for (const [label, w] of shown) rows.push(windowRow(label, w.remainingPercent, w.resetsAt))
+      } else {
+        rows.push(windowRow("1mo", (balance.balanceUsd! / balance.allowanceUsd!) * 100, balance.periodUntil))
+        const purchased = balance.purchasedUsd ?? 0
+        const extra = purchased > 0 ? ` · +$${purchased.toFixed(2)}` : ""
+        rows.push({
+          kind: "text",
+          text: `$${balance.balanceUsd!.toFixed(2)} / $${balance.allowanceUsd!.toFixed(2)}${extra}`,
+        })
+      }
+      if (balanceCache.lastSet > 0 && balanceCache.stale) rows.push({ kind: "text", text: "· stale" })
+      return rows
+    }
+
     // One view per provider (plus go's plan-quota rows and zen's free-tier
     // breakdown). Built from the same discovery the picker and tool use, so a
     // new provider needs no code change. Go stays first — it was the original
@@ -501,6 +679,7 @@ export default Plugin.define({
       const priority = new Map<string, number>([
         [GO_PROVIDER, 0],
         [ZEN_PROVIDER, 1],
+        [OLLAMA_PROVIDER, 2],
       ])
       return [...ids]
         .sort((a, b) => (priority.get(a) ?? 99) - (priority.get(b) ?? 99))
@@ -515,6 +694,17 @@ export default Plugin.define({
               description: "Go plan usage line and quota windows",
               providerID: pid,
               rows: (_sessionID) => [{ kind: "usage", label, providerID: pid }, ...planQuotaRows()],
+            }
+          }
+          // Ollama Cloud reports its own limits/credits. OpenCode already shows
+          // the local token/cost totals, so the view just labels the section.
+          if (pid === OLLAMA_PROVIDER) {
+            return {
+              id: pid,
+              title: "Ollama Cloud",
+              description: "Ollama Cloud plan limits and remaining credits",
+              providerID: pid,
+              rows: () => [{ kind: "text", text: "Ollama usage:" }, ...ollamaQuotaRows()],
             }
           }
           // zen = free-tier breakdown; any other provider = its model usage.
@@ -560,6 +750,9 @@ export default Plugin.define({
       // connected set alone would drop known-but-disconnected providers, and
       // the picker needs those in the registry to explain how to add them.
       const ids = new Set([...availableProviders(), ...connected.ids()])
+      // An env-only Ollama key is not in the auth store, but the integration
+      // still treats it as configured, so surface its view too.
+      if (process.env.OLLAMA_API_KEY && !ids.has(OLLAMA_PROVIDER)) ids.add(OLLAMA_PROVIDER)
       // Never empty: the picker needs a first entry and a registry-less footer
       // has nothing to paint. Mirrors the kit's own Zen+Go fallback.
       if (ids.size === 0) ids.add(GO_PROVIDER).add(ZEN_PROVIDER)
@@ -618,7 +811,9 @@ export default Plugin.define({
       replace: "sidebar.footer",
       render: ({ sessionID }: { sessionID?: string }) => {
         // No workspace key configured: render nothing instead of dead weight.
-        if (apiKeys().length === 0) return null
+        // Ollama Cloud keeps its key in the same stores but is not a
+        // workspace plan key, so check it separately.
+        if (apiKeys().length === 0 && ollamaKey() === "") return null
 
         // Pick up providers connected since the last render. This is a plain
         // array mutation behind a change check — it writes no signal, so it
@@ -642,6 +837,7 @@ export default Plugin.define({
 
     return () => {
       polling.stop()
+      ollamaPolling.stop()
       connected.stop()
       slot?.()
     }

@@ -19,6 +19,9 @@ const {
   providerUsage,
   fetchUsage,
   createUsageStore,
+  parseOllamaBalance,
+  ollamaKey,
+  fetchOllamaBalance,
   renderUsageRow,
   renderWindowRow,
   renderRow,
@@ -63,6 +66,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
+  vi.unstubAllEnvs()
 })
 
 describe("apiKeys", () => {
@@ -549,6 +553,141 @@ describe("createUsageStore", () => {
     expect(store.stale).toBe(false)
     vi.advanceTimersByTime(121_000)
     expect(store.stale).toBe(true)
+  })
+})
+
+describe("parseOllamaBalance", () => {
+  const UNTIL = new Date(T0 + 600_000).toISOString()
+
+  it("parses credit and legacy plans", () => {
+    expect(
+      parseOllamaBalance({
+        included: { balance_usd: 55.08, allowance_usd: 60, period: { until: UNTIL } },
+        purchased: { balance_usd: 4.27 },
+      }),
+    ).toEqual({ mode: "credits", balanceUsd: 55.08, allowanceUsd: 60, periodUntil: UNTIL, purchasedUsd: 4.27 })
+
+    expect(
+      parseOllamaBalance({
+        included: {
+          session: { remaining_percent: 75, resets_at: UNTIL },
+          weekly: { remaining_percent: 40, resets_at: "not-a-date" },
+        },
+        purchased: { balance_usd: 0 },
+      }),
+    ).toEqual({
+      mode: "limits",
+      session: { remainingPercent: 75, resetsAt: UNTIL },
+      weekly: { remainingPercent: 40, resetsAt: undefined },
+      purchasedUsd: 0,
+    })
+  })
+
+  it("clamps percentages and ignores a non-numeric purchased balance", () => {
+    expect(
+      parseOllamaBalance({
+        included: {
+          session: { remaining_percent: 150 },
+          weekly: { remaining_percent: -5, resets_at: 123 },
+        },
+      }),
+    ).toEqual({
+      mode: "limits",
+      session: { remainingPercent: 100, resetsAt: undefined },
+      weekly: { remainingPercent: 0, resetsAt: undefined },
+      purchasedUsd: undefined,
+    })
+    expect(
+      parseOllamaBalance({
+        included: { balance_usd: 5, allowance_usd: 10, period: { until: UNTIL } },
+        purchased: { balance_usd: "2" },
+      }),
+    ).toMatchObject({ purchasedUsd: undefined })
+  })
+
+  it("rejects malformed payloads and incomplete plans", () => {
+    expect(parseOllamaBalance(null)).toBeNull()
+    expect(parseOllamaBalance({ included: "nope" })).toBeNull()
+    expect(parseOllamaBalance({ included: {} })).toBeNull()
+    expect(parseOllamaBalance({ included: { session: { remaining_percent: 50 } } })).toBeNull()
+    expect(parseOllamaBalance({ included: { session: { remaining_percent: Number.POSITIVE_INFINITY } } })).toBeNull()
+    expect(parseOllamaBalance({ included: { balance_usd: 5, allowance_usd: 10 } })).toBeNull()
+    expect(parseOllamaBalance({ included: { balance_usd: 5, allowance_usd: 10, period: { until: "bad" } } })).toBeNull()
+    expect(parseOllamaBalance({ included: { allowance_usd: 10, period: { until: UNTIL } } })).toBeNull()
+    expect(parseOllamaBalance({ included: { balance_usd: 5, period: { until: UNTIL } } })).toBeNull()
+    expect(parseOllamaBalance({ included: { balance_usd: 5, allowance_usd: 0, period: { until: UNTIL } } })).toBeNull()
+  })
+})
+
+describe("ollamaKey", () => {
+  it("resolves, trims, and caches the stored key with an env fallback", () => {
+    mockState.authKeys = [" stored "]
+    expect(ollamaKey()).toBe("stored")
+    mockState.authKeys = []
+    expect(ollamaKey()).toBe("stored") // cached
+    __resetProviderUsageCache()
+    vi.stubEnv("OLLAMA_API_KEY", " env ")
+    expect(ollamaKey()).toBe("env")
+    __resetProviderUsageCache()
+    vi.unstubAllEnvs()
+    expect(ollamaKey()).toBe("")
+  })
+})
+
+describe("fetchOllamaBalance", () => {
+  const CREDITS = {
+    included: { balance_usd: 55.08, allowance_usd: 60, period: { until: new Date(T0 + 600_000).toISOString() } },
+    purchased: { balance_usd: 4.27 },
+  }
+
+  it("returns null without a key and never fetches", async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal("fetch", fetchMock)
+    mockState.authKeys = []
+    await expect(fetchOllamaBalance()).resolves.toBeNull()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("fetches with bearer auth and parses the balance", async () => {
+    mockState.authKeys = ["ollama-key"]
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => CREDITS })
+    vi.stubGlobal("fetch", fetchMock)
+    await expect(fetchOllamaBalance()).resolves.toEqual({
+      mode: "credits",
+      balanceUsd: 55.08,
+      allowanceUsd: 60,
+      periodUntil: CREDITS.included.period.until,
+      purchasedUsd: 4.27,
+    })
+    expect(fetchMock.mock.calls[0][0]).toBe("https://ollama.com/api/balance")
+    expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe("Bearer ollama-key")
+  })
+
+  it("honors Retry-After and falls back to the poll interval", async () => {
+    mockState.authKeys = ["ollama-key"]
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 429, headers: { get: () => "2" }, json: async () => ({}) })
+      .mockResolvedValueOnce({ ok: false, status: 429, json: async () => ({}) })
+    vi.stubGlobal("fetch", fetchMock)
+
+    await expect(fetchOllamaBalance()).resolves.toBeNull() // Retry-After: 2s
+    await expect(fetchOllamaBalance()).resolves.toBeNull() // skipped
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    vi.advanceTimersByTime(2_001)
+    await expect(fetchOllamaBalance()).resolves.toBeNull() // no header → 60s
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await expect(fetchOllamaBalance()).resolves.toBeNull() // skipped
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("returns null on error responses and network failures", async () => {
+    mockState.authKeys = ["ollama-key"]
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, json: async () => ({}) }))
+    await expect(fetchOllamaBalance()).resolves.toBeNull()
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")))
+    await expect(fetchOllamaBalance()).resolves.toBeNull()
   })
 })
 

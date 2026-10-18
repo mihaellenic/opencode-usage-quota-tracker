@@ -17,7 +17,7 @@ vi.mock("opencode-plugin-kit", async (importOriginal) => {
 })
 
 const tui = (await import("../tui.tsx")).default as { setup: (ctx: any) => () => void }
-const { __resetProviderUsageCache } = await import("../tui.tsx")
+const { __resetProviderUsageCache, OLLAMA_PROVIDER } = await import("../tui.tsx")
 
 const T0 = Date.UTC(2026, 0, 14, 12)
 const FUTURE = new Date(Date.now() + 600_000).toISOString()
@@ -228,6 +228,115 @@ describe("setup: go view (plan quota rows)", () => {
     expect(text).toContain("5h")
     expect(text).toContain("· stale")
     run.cleanup()
+  })
+})
+
+describe("setup: ollama cloud view (balance rows)", () => {
+  const CREDITS = {
+    included: { balance_usd: 3.61, allowance_usd: 60, period: { until: FUTURE } },
+    purchased: { balance_usd: 4.27 },
+  }
+  const CREDIT_ONLY = { included: { balance_usd: 30, allowance_usd: 60, period: { until: FUTURE } } }
+  const LIMITS = {
+    included: { session: { remaining_percent: 75, resets_at: FUTURE }, weekly: { remaining_percent: 40 } },
+  }
+
+  // Both pollers share the process, so answer the Ollama endpoint and fail the
+  // workspace endpoint. That keeps the Go fetch from poisoning the assertion.
+  function ollamaFetch(body: unknown) {
+    return vi.fn(async (url: unknown) => {
+      if (String(url).includes("ollama.com")) return { ok: true, status: 200, json: async () => body }
+      return { ok: false, status: 500, json: async () => ({}) }
+    })
+  }
+
+  it("renders credits with a low-balance warning and merged dollars", async () => {
+    mockState.keys = ["ollama-key"]
+    mockState.providers = [OLLAMA_PROVIDER]
+    vi.stubGlobal("fetch", ollamaFetch(CREDITS))
+    const run = await startPlugin({ integrations: [{ id: OLLAMA_PROVIDER, connections: [{}] }] })
+    await flush()
+    expect(footerText(run)).toBe(
+      ["Ollama usage:", `1mo ${bar(94)} 94% ⚠ · resets ${until(FUTURE)}`, "$3.61 / $60.00 · +$4.27"].join("\n"),
+    )
+  })
+
+  it("shows a pending placeholder until the first balance arrives", async () => {
+    mockState.keys = ["ollama-key"]
+    mockState.providers = [OLLAMA_PROVIDER]
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) })),
+    )
+    const run = await startPlugin({ integrations: [{ id: OLLAMA_PROVIDER, connections: [{}] }] })
+    await flush()
+    expect(footerText(run)).toBe("Ollama usage:\nollama quota —")
+  })
+
+  it("renders legacy limits", async () => {
+    mockState.keys = ["ollama-key"]
+    mockState.providers = [OLLAMA_PROVIDER]
+    vi.stubGlobal("fetch", ollamaFetch(LIMITS))
+    const run = await startPlugin({ integrations: [{ id: OLLAMA_PROVIDER, connections: [{}] }] })
+    await flush()
+    expect(footerText(run)).toBe(
+      ["Ollama usage:", `5h  ${bar(25)} 25% · resets ${until(FUTURE)}`, `1w  ${bar(60)} 60%`].join("\n"),
+    )
+  })
+
+  it("compact mode keeps the tighter window", async () => {
+    mockState.keys = ["ollama-key"]
+    mockState.providers = [OLLAMA_PROVIDER]
+    vi.stubGlobal("fetch", ollamaFetch(LIMITS))
+    const weekly = await startPlugin({
+      options: { compact: true },
+      integrations: [{ id: OLLAMA_PROVIDER, connections: [{}] }],
+    })
+    await flush()
+    expect(footerText(weekly)).toBe(`Ollama usage:\n1w  ${bar(60)} 60%`)
+
+    vi.stubGlobal(
+      "fetch",
+      ollamaFetch({ included: { session: { remaining_percent: 20 }, weekly: { remaining_percent: 80 } } }),
+    )
+    const session = await startPlugin({
+      options: { compact: true },
+      integrations: [{ id: OLLAMA_PROVIDER, connections: [{}] }],
+    })
+    await flush()
+    expect(footerText(session)).toBe(`Ollama usage:\n5h  ${bar(80)} 80%`)
+  })
+
+  it("keeps the last credits and marks them stale after failed refreshes", async () => {
+    vi.useFakeTimers({ now: T0 })
+    mockState.keys = ["ollama-key"]
+    mockState.providers = [OLLAMA_PROVIDER]
+    vi.stubGlobal("fetch", ollamaFetch(CREDIT_ONLY))
+    const run = await startPlugin({ integrations: [{ id: OLLAMA_PROVIDER, connections: [{}] }] })
+    await vi.advanceTimersByTimeAsync(1)
+    expect(footerText(run)).toContain("$30.00 / $60.00")
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) })),
+    )
+    await vi.advanceTimersByTimeAsync(121_000)
+    const text = footerText(run)
+    expect(text).toContain("$30.00 / $60.00")
+    expect(text).toContain("· stale")
+    run.cleanup()
+  })
+
+  it("renders the Ollama view with an env-only key", async () => {
+    mockState.keys = []
+    mockState.providers = []
+    vi.stubEnv("OLLAMA_API_KEY", "env-key")
+    vi.stubGlobal("fetch", ollamaFetch(CREDIT_ONLY))
+    const run = await startPlugin({ integrations: [] })
+    await flush()
+    expect(footerText(run)).toBe(
+      ["Ollama usage:", `1mo ${bar(50)} 50% · resets ${until(FUTURE)}`, "$30.00 / $60.00"].join("\n"),
+    )
   })
 })
 
